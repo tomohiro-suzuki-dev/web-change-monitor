@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 import json
 import os
 from datetime import datetime
@@ -7,11 +8,13 @@ from pathlib import Path
 
 import requests
 import yaml
+from PIL import Image, ImageChops, ImageDraw
 from playwright.async_api import async_playwright
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 SCREENSHOTS_DIR = Path("screenshots")
 HASHES_FILE = Path("hashes.json")
+DIFF_THRESHOLD = 30  # 0〜255：小さいほど微細な差分も検知
 
 
 async def take_screenshot(page, url: str) -> bytes:
@@ -21,6 +24,37 @@ async def take_screenshot(page, url: str) -> bytes:
 
 def compute_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def annotate_diff(prev_bytes: bytes, curr_bytes: bytes) -> bytes:
+    """前回・今回のスクリーンショットを比較し、差分箇所に赤枠を描画して返す。"""
+    prev = Image.open(io.BytesIO(prev_bytes)).convert("RGB")
+    curr = Image.open(io.BytesIO(curr_bytes)).convert("RGB")
+
+    if prev.size != curr.size:
+        prev = prev.resize(curr.size)
+
+    diff = ImageChops.difference(prev, curr)
+    diff_thresh = diff.convert("L").point(lambda p: 255 if p > DIFF_THRESHOLD else 0)
+    bbox = diff_thresh.getbbox()
+
+    if bbox is None:
+        output = io.BytesIO()
+        curr.save(output, format="PNG")
+        return output.getvalue()
+
+    annotated = curr.copy()
+    draw = ImageDraw.Draw(annotated)
+    padding = 15
+    left = max(0, bbox[0] - padding)
+    upper = max(0, bbox[1] - padding)
+    right = min(curr.width, bbox[2] + padding)
+    lower = min(curr.height, bbox[3] + padding)
+    draw.rectangle([left, upper, right, lower], outline=(255, 0, 0), width=4)
+
+    output = io.BytesIO()
+    annotated.save(output, format="PNG")
+    return output.getvalue()
 
 
 def send_discord_notification(url: str, screenshot: bytes):
@@ -76,16 +110,22 @@ async def main():
             current_hashes[url] = current_hash
 
             safe_name = url.replace("://", "_").replace("/", "_").replace(".", "_")[:100]
-            (SCREENSHOTS_DIR / f"{safe_name}.png").write_bytes(screenshot)
+            screenshot_path = SCREENSHOTS_DIR / f"{safe_name}.png"
 
             if url in previous_hashes:
                 if previous_hashes[url] != current_hash:
                     print(f"Change detected: {url}")
-                    send_discord_notification(url, screenshot)
+                    if screenshot_path.exists():
+                        annotated = annotate_diff(screenshot_path.read_bytes(), screenshot)
+                    else:
+                        annotated = screenshot
+                    send_discord_notification(url, annotated)
                 else:
                     print(f"No change: {url}")
             else:
                 print(f"First run (baseline saved): {url}")
+
+            screenshot_path.write_bytes(screenshot)
 
         await browser.close()
 
